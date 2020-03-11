@@ -846,3 +846,25 @@ msgstr "客户端文件不适合当前设备。"
 
 msgid "Can't move new file to path: %s"
 msgstr "无法移动新文件到：%s"
+
+msgid "Enable MultiProcess"
+msgstr "开启多进程"
+
+msgid "Enable Load Balancing Session one"
+msgstr "开启负载均衡进程1"
+
+msgid "Enable Load Balancing Session two"
+msgstr "开启负载均衡进程2"
+
+msgid "Haproxy Port Session 1"
+msgstr "均衡进程1端口"
+
+msgid "Haproxy Port Session 2"
+msgstr "均衡进程2端口"
+
+msgid "Session 1 Load Balancing Setting"
+msgstr "进程1负载均衡设置"
+
+msgid "Session 2 Load Balancing Setting"
+msgstr "进程2负载均衡设置"
+
