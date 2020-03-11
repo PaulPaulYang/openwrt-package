@@ -21,6 +21,7 @@ LUA_API_PATH=/usr/lib/lua/luci/model/cbi/$CONFIG/api
 API_GEN_TROJAN=$LUA_API_PATH/gen_trojan.lua
 API_GEN_V2RAY=$LUA_API_PATH/gen_v2ray.lua
 API_GEN_V2RAY_SHUNT=$LUA_API_PATH/gen_v2ray_shunt.lua
+FWI=$(uci get firewall.passwall.path 2>/dev/null)
 
 echolog() {
 	local d="$(date "+%Y-%m-%d %H:%M:%S")"
@@ -498,6 +499,12 @@ clean_log() {
 
 start_crontab() {
 	sed -i '/$CONFIG/d' /etc/crontabs/root >/dev/null 2>&1 &
+	start_daemon=$(config_t_get global_delay start_daemon)
+	if [ "$start_daemon" = "1" ]; then
+		echo "*/1 * * * * nohup $APP_PATH/monitor.sh > /dev/null 2>&1" >>/etc/crontabs/root
+		echolog "已启动守护进程。"
+	fi
+
 	auto_on=$(config_t_get global_delay auto_on 0)
 	if [ "$auto_on" = "1" ]; then
 		time_off=$(config_t_get global_delay time_off)
@@ -517,15 +524,24 @@ start_crontab() {
 		}
 	fi
 
+	AUTO_SWITCH_ENABLE=$(config_t_get auto_switch enable 0)
+	[ "$AUTO_SWITCH_ENABLE" = "1" ] && {
+		testing_time=$(config_t_get auto_switch testing_time)
+		[ -n "$testing_time" ] && {
+			echo "*/$testing_time * * * * nohup $APP_PATH/test.sh > /dev/null 2>&1" >>/etc/crontabs/root
+			echolog "配置定时任务：每$testing_time分钟执行自动切换检测脚本。"
+		}
+	}
+	
 	autoupdate=$(config_t_get global_rules auto_update)
 	weekupdate=$(config_t_get global_rules week_update)
 	dayupdate=$(config_t_get global_rules time_update)
-	if [ "$autoupdate" = "1" ]; then
-		local t="0 $dayupdate * * $weekupdate"
-		[ "$weekupdate" = "7" ] && t="0 $dayupdate * * *"
-		echo "$t lua $APP_PATH/rule_update.lua nil log > /dev/null 2>&1 &" >>/etc/crontabs/root
-		echolog "配置定时任务：自动更新规则。"
-	fi
+	#if [ "$autoupdate" = "1" ]; then
+	#	local t="0 $dayupdate * * $weekupdate"
+	#	[ "$weekupdate" = "7" ] && t="0 $dayupdate * * *"
+	#	echo "$t lua $APP_PATH/rule_update.lua nil log > /dev/null 2>&1 &" >>/etc/crontabs/root
+	#	echolog "配置定时任务：自动更新规则。"
+	#fi
 
 	autoupdatesubscribe=$(config_t_get global_subscribe auto_update_subscribe)
 	weekupdatesubscribe=$(config_t_get global_subscribe week_update_subscribe)
@@ -537,18 +553,13 @@ start_crontab() {
 		echolog "配置定时任务：自动更新节点订阅。"
 	fi
 	
-	start_daemon=$(config_t_get global_delay start_daemon 0)
-	[ "$start_daemon" = "1" ] && $APP_PATH/monitor.sh > /dev/null 2>&1 &
-	
-	AUTO_SWITCH_ENABLE=$(config_t_get auto_switch enable 0)
-	[ "$AUTO_SWITCH_ENABLE" = "1" ] && $APP_PATH/test.sh > /dev/null 2>&1 &
-	
 	/etc/init.d/cron restart
 }
 
 stop_crontab() {
 	sed -i "/$CONFIG/d" /etc/crontabs/root >/dev/null 2>&1 &
 	ps | grep "$APP_PATH/test.sh" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1 &
+	rm -f /var/lock/${CONFIG}_test.lock >/dev/null 2>&1 &
 	/etc/init.d/cron restart
 	echolog "清除定时执行命令。"
 }
@@ -749,14 +760,25 @@ stop_dnsmasq() {
 }
 
 start_haproxy() {
-	enabled=$(config_t_get global_haproxy balancing_enable 0)
-	[ "$enabled" = "1" ] && {
+	enabled1=$(config_t_get global_haproxy balancing1_enable 0)
+	enabled2=$(config_t_get global_haproxy balancing2_enable 0)
+	mp_enable=$(config_t_get global_haproxy Multiprocess_enable 0)
+    s1_haproxy_port=$(config_t_get global_haproxy haproxy_port1)
+	s2_haproxy_port=$(config_t_get global_haproxy haproxy_port2)
+	console_port=$(config_t_get global_haproxy console_port)
+	console_user=$(config_t_get global_haproxy console_user)
+	console_password=$(config_t_get global_haproxy console_password)
+
+	[ "$enabled1" = "1" ] && {
 		haproxy_bin=$(find_bin haproxy)
 		[ -f "$haproxy_bin" ] && {
 			local HAPROXY_PATH=$TMP_PATH/haproxy
 			mkdir -p $HAPROXY_PATH
 			local HAPROXY_FILE=$HAPROXY_PATH/config.cfg
-			bport=$(config_t_get global_haproxy haproxy_port)
+
+			local auth=""
+			[ -n "$console_user" -a -n "console_password" ] && auth="stats auth $console_user:$console_password"
+
 			cat <<-EOF >$HAPROXY_FILE
 				global
 				    log         127.0.0.1 local2
@@ -783,22 +805,31 @@ start_haproxy() {
 				    timeout http-keep-alive 10s
 				    timeout check           10s
 				    maxconn                 3000
-					
-				listen passwall
-				    bind 0.0.0.0:$bport
+
+				listen status
+				    bind 0.0.0.0:$console_port
+				    mode http                   
+				    stats refresh 30s
+				    stats uri /
+				    stats admin if TRUE
+				    $auth
+				
+				listen PassWallSession-1
+				    bind 127.0.0.1:$s1_haproxy_port
+				    bind-process 1
 				    mode tcp
 			EOF
-			local count=$(uci show $CONFIG | grep "@balancing" | sed -n '$p' | cut -d '[' -f 2 | cut -d ']' -f 1)
+                local count=$(uci show $CONFIG | grep "@balancingsession1" | sed -n '$p' | cut -d '[' -f 2 | cut -d ']' -f 1)
 			[ -n "$count" -a "$count" -ge 0 ] && {
 				u_get() {
-					local ret=$(uci -q get $CONFIG.@balancing[$1].$2)
+					local ret=$(uci -q get $CONFIG.@balancingsession1[$1].$2)
 					echo ${ret:=$3}
 				}
 				for i in $(seq 0 $count); do
-					enabled=$(u_get $i enabled 0)
-					[ "$enabled" == "0" ] && continue
-					bips=$(u_get $i lbss)
-					bports=$(u_get $i lbort)
+					enabled=$(u_get $i enabled1 0)
+					[ "$enabled1" == "0" ] && continue
+					bips=$(u_get $i lbss1)
+					bports=$(u_get $i lbort1)
 					if [ -z "$bips" ] || [ -z "$bports" ]; then
 						break
 					fi
@@ -807,24 +838,16 @@ start_haproxy() {
 					[ "$bports" != "default" ] && bport=$bports
 					[ -z "$bport" ] && break
 					
-					bweight=$(u_get $i lbweight)
-					exports=$(u_get $i export)
-					bbackup=$(u_get $i backup)
+					bweight=$(u_get $i lbweight1)
+					exports=$(u_get $i export1)
+					bbackup=$(u_get $i backup1)
 					if [ "$bbackup" = "1" ]; then
 						bbackup=" backup"
-						echolog "负载均衡：添加故障转移备节点:$bip"
+						echolog "负载均衡1：添加故障转移备节点:$bip"
 					else
 						bbackup=""
-						echolog "负载均衡：添加负载均衡主节点:$bip"
+						echolog "负载均衡1：添加负载均衡主节点:$bip"
 					fi
-					#si=$(echo $bip | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}")
-					#if [ -z "$si" ]; then
-					#	bip=$(resolveip -4 -t 2 $bip | awk 'NR==1{print}')
-					#	if [ -z "$bip" ]; then
-					#		bip=$(nslookup $bip localhost | sed '1,4d' | awk '{print $3}' | grep -v : | awk 'NR==1{print}')
-					#	fi
-					#	echolog "负载均衡${i} IP为：$bip"
-					#fi
 					echo "    server $bip:$bport $bip:$bport weight $bweight check inter 1500 rise 1 fall 3 $bbackup" >> $HAPROXY_FILE
 					if [ "$exports" != "0" ]; then
 						failcount=0
@@ -837,32 +860,104 @@ start_haproxy() {
 								sleep 1m
 							else
 								route add -host ${bip} dev ${exports}
-								echo "$bip" >>/tmp/balancing_ip
+								echo "$bip" >>/tmp/balancingsession1_ip
 								break
 							fi
 						done
 					fi
 				done
 			}
-			#生成负载均衡控制台
-			console_port=$(config_t_get global_haproxy console_port)
-			console_user=$(config_t_get global_haproxy console_user)
-			console_password=$(config_t_get global_haproxy console_password)
-			local auth=""
-			[ -n "$console_user" -a -n "console_password" ] && auth="stats auth $console_user:$console_password"
-			cat <<-EOF >> $HAPROXY_FILE
-			
-				listen status
-				    bind 0.0.0.0:$console_port
-				    mode http                   
-				    stats refresh 30s
-				    stats uri /
-				    stats admin if TRUE
-					$auth
+			 
+            
+           
+          if [ $enabled2 == 1 ]; then
+		  	if [ $mp_enable == 1 ]; then 
+			  	local mp2=2 
+			else 
+				mp2=2
+			fi
+            cat <<-EOF >>$HAPROXY_FILE
+
+				listen PassWallSession-2
+				    bind 127.0.0.1:$s2_haproxy_port
+				    bind-process $(expr $mp_enable + 1)
+				    mode tcp
 			EOF
+            local count=$(uci show $CONFIG | grep "@balancingsession2" | sed -n '$p' | cut -d '[' -f 2 | cut -d ']' -f 1)
+            [ -n "$count" -a "$count" -ge 0 ] && {
+                u_get() {
+                    local ret=$(uci -q get $CONFIG.@balancingsession2[$1].$2)
+                    echo ${ret:=$3}
+                }
+                for i in $(seq 0 $count); do
+                    enabled=$(u_get $i enabled2 0)
+                    [ "$enabled" == "0" ] && continue
+                    bips=$(u_get $i lbss2)
+                    bports=$(u_get $i lbort2)
+                    if [ -z "$bips" ] || [ -z "$bports" ]; then
+                        break
+                    fi
+                    local bip=$(echo $bips | awk -F ":" '{print $1}')
+                    local bport=$(echo $bips | awk -F ":" '{print $2}')
+                    [ "$bports" != "default" ] && bport=$bports
+                    [ -z "$bport" ] && break
+                        
+                    bweight=$(u_get $i lbweight2)
+                    exports=$(u_get $i export2)
+                    bbackup=$(u_get $i backup2)
+                    if [ "$bbackup" = "1" ]; then
+                        bbackup=" backup"
+                        echolog "负载均衡2：添加故障转移备节点:$bip"
+                    else
+                        bbackup=""
+                        echolog "负载均衡2：添加负载均衡主节点:$bip"
+                    fi
+                    echo "    server $bip:$bport $bip:$bport weight $bweight check inter 1500 rise 1 fall 3 $bbackup" >> $HAPROXY_FILE
+                    if [ "$exports" != "0" ]; then
+                        failcount=0
+                        while [ "$failcount" -lt "3" ]; do
+                            interface=$(ifconfig | grep "$exports" | awk '{print $1}')
+                            if [ -z "$interface" ]; then
+                                echolog "找不到出口接口：$exports，1分钟后再重试"
+                                let "failcount++"
+                                [ "$failcount" -ge 3 ] && exit 0
+                                sleep 1m
+                            else
+                                route add -host ${bip} dev ${exports}
+                                echo "$bip" >>/tmp/balancingsession2_ip
+                                break
+                            fi
+                        done
+                    fi
+                  done
+                }
+            fi  
 			ln_start_bin $haproxy_bin haproxy "-f $HAPROXY_FILE"
 		}
 	}
+}
+
+
+flush_include() {
+	echo '#!/bin/sh' >$FWI
+}
+
+gen_include() {
+	flush_include
+	extract_rules() {
+		echo "*$1"
+		iptables-save -t $1 | grep PSW | \
+		sed -e "s/^-A \(OUTPUT\|PREROUTING\)/-I \1 1/"
+		echo 'COMMIT'
+	}
+	cat <<-EOF >>$FWI
+		iptables-save -c | grep -v "PSW" | iptables-restore -c
+		iptables-restore -n <<-EOT
+		$(extract_rules nat)
+		$(extract_rules mangle)
+		EOT
+	EOF
+	return 0
 }
 
 kill_all() {
@@ -898,11 +993,20 @@ start() {
 	start_dns
 	add_dnsmasq
 	source $APP_PATH/iptables.sh start
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1 &
+	gen_include
 	start_crontab
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 &
 	echolog "运行完成！\n"
 	rm -f "$LOCK_FILE"
 	return 0
+}
+
+hatest() {
+	[ -f "$LOCK_FILE" ] && return 3
+	touch "$LOCK_FILE"
+	start_haproxy
+	echolog "运行完成！\n"
+	rm -f "$LOCK_FILE"
 }
 
 stop() {
@@ -918,10 +1022,9 @@ stop() {
 	done
 	clean_log
 	source $APP_PATH/iptables.sh stop
+	flush_include
 	kill_all v2ray-plugin obfs-local
-	ps -w | grep -v "grep" | grep $CONFIG/test.sh | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1 &
-	ps -w | grep -v "grep" | grep $CONFIG/monitor.sh | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1 &
-	ps -w | grep -v "grep" | grep -E "$TMP_PATH" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1 &
+	ps -w | grep -E "$TMP_PATH" | grep -v "grep" | awk '{print $1}' | xargs kill -9 >/dev/null 2>&1 &
 	rm -rf $TMP_DNSMASQ_PATH $TMP_PATH
 	stop_dnsmasq
 	stop_crontab
@@ -948,4 +1051,8 @@ start)
 boot)
 	boot
 	;;
+hatest)
+	hatest
+	;;
 esac
+
